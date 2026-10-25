@@ -1,0 +1,429 @@
+// ============================================================
+//  SourceEngineKit.cs — Gói tổng hợp: Movement + Recoil + Prediction
+//  Tự chứa, không phụ thuộc package ngoài. Dán vào Assets/Scripts/.
+//  Dùng Input Manager cũ (Horizontal/Vertical/Jump/Mouse X/Mouse Y).
+// ============================================================
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace SourceKit
+{
+    // ========================================================
+    // 1. MOVE VARS
+    // ========================================================
+    [CreateAssetMenu(menuName = "Source/MoveVars", fileName = "MoveVars")]
+    public class SourceMoveVars : ScriptableObject
+    {
+        [Header("Ground")]
+        public float maxSpeed        = 320f;
+        public float accelerate      = 5.5f;
+        public float friction        = 5.2f;
+        public float stopSpeed       = 100f;
+
+        [Header("Air")]
+        public float airAccelerate   = 12f;
+        public float airMaxSpeed     = 30f;
+        public float gravity         = 800f;
+
+        [Header("Jump")]
+        public float jumpSpeed       = 301.993f;
+        public float jumpCooldown    = 0.5f;
+        public float coyoteTime      = 0.1f;
+
+        [Header("Crouch")]
+        public float crouchSpeedMul  = 0.34f;
+        public float crouchHeight    = 1.0f;
+        public float standHeight     = 1.8f;
+        public float crouchLerpSpeed = 10f;
+
+        [Header("Step / Surf")]
+        public float stepOffset      = 0.35f;
+        public float slopeLimit      = 45f;
+        public float surfGravityMul  = 0.6f;
+    }
+
+    // ========================================================
+    // 2. MOVEMENT
+    // ========================================================
+    [RequireComponent(typeof(CharacterController))]
+    public class SourceMovement : MonoBehaviour
+    {
+        public SourceMoveVars vars;
+        public Transform cameraPivot;
+
+        private CharacterController cc;
+        private Vector3 velocity;
+        private float lastJumpTime = -999f;
+        private float lastGroundedTime = -999f;
+        private bool jumpedThisFrame;
+        private bool isCrouching;
+        private bool isGrounded;
+
+        [HideInInspector] public Vector3 ExternalVelocity;
+
+        void Awake()
+        {
+            cc = GetComponent<CharacterController>();
+            cc.stepOffset = vars.stepOffset;
+            cc.slopeLimit = vars.slopeLimit;
+        }
+
+        public void Tick(Vector3 wishDir, bool jumpPressed, bool crouchHeld, float dt)
+        {
+            isGrounded = cc.isGrounded;
+            if (isGrounded) lastGroundedTime = Time.time;
+
+            HandleCrouch(crouchHeld, dt);
+
+            float wishSpeed = vars.maxSpeed * (isCrouching ? vars.crouchSpeedMul : 1f);
+
+            if (isGrounded && !jumpedThisFrame) ApplyFriction(dt);
+
+            if (isGrounded) Accelerate(wishDir, wishSpeed, vars.accelerate, dt);
+            else            AirAccelerate(wishDir, wishSpeed, vars.airAccelerate, dt);
+
+            HandleJump(jumpPressed);
+
+            float g = vars.gravity;
+            if (!isGrounded && IsOnSurfSurface()) g *= vars.surfGravityMul;
+            velocity.y -= g * dt;
+
+            CollisionFlags flags = cc.Move((velocity + ExternalVelocity) * dt);
+            if ((flags & CollisionFlags.Below) != 0 && velocity.y < 0f) velocity.y = 0f;
+        }
+
+        void ApplyFriction(float dt)
+        {
+            Vector3 horiz = new Vector3(velocity.x, 0f, velocity.z);
+            float speed = horiz.magnitude;
+            if (speed < 0.1f) { velocity.x = velocity.z = 0f; return; }
+
+            float control = speed < vars.stopSpeed ? vars.stopSpeed : speed;
+            float drop = control * vars.friction * dt;
+            float newSpeed = Mathf.Max(0f, speed - drop) / speed;
+            velocity.x *= newSpeed;
+            velocity.z *= newSpeed;
+        }
+
+        void Accelerate(Vector3 wishDir, float wishSpeed, float accel, float dt)
+        {
+            float current = Vector3.Dot(new Vector3(velocity.x, 0f, velocity.z), wishDir);
+            float addSpeed = wishSpeed - current;
+            if (addSpeed <= 0f) return;
+
+            float accelSpeed = accel * wishSpeed * dt;
+            if (accelSpeed > addSpeed) accelSpeed = addSpeed;
+
+            velocity.x += accelSpeed * wishDir.x;
+            velocity.z += accelSpeed * wishDir.z;
+        }
+
+        void AirAccelerate(Vector3 wishDir, float wishSpeed, float accel, float dt)
+        {
+            float wishSpd = Mathf.Min(wishSpeed, vars.airMaxSpeed);
+            float current = Vector3.Dot(new Vector3(velocity.x, 0f, velocity.z), wishDir);
+            float addSpeed = wishSpd - current;
+            if (addSpeed <= 0f) return;
+
+            float accelSpeed = accel * wishSpeed * dt; // dùng wishSpeed gốc -> bhop
+            if (accelSpeed > addSpeed) accelSpeed = addSpeed;
+
+            velocity.x += accelSpeed * wishDir.x;
+            velocity.z += accelSpeed * wishDir.z;
+        }
+
+        void HandleJump(bool jumpPressed)
+        {
+            bool canJump = (Time.time - lastGroundedTime) <= vars.coyoteTime
+                           && (Time.time - lastJumpTime) > vars.jumpCooldown;
+
+            if (jumpPressed && canJump)
+            {
+                velocity.y = vars.jumpSpeed;
+                lastJumpTime = Time.time;
+                jumpedThisFrame = true;
+            }
+            else jumpedThisFrame = false;
+        }
+
+        void HandleCrouch(bool crouchHeld, float dt)
+        {
+            isCrouching = crouchHeld;
+            float targetH = isCrouching ? vars.crouchHeight : vars.standHeight;
+            float h = Mathf.Lerp(cc.height, targetH, vars.crouchLerpSpeed * dt);
+            cc.height = h;
+            cc.center = new Vector3(0f, h * 0.5f, 0f);
+            if (cameraPivot != null)
+                cameraPivot.localPosition = new Vector3(0f, h - 0.2f, 0f);
+        }
+
+        bool IsOnSurfSurface()
+        {
+            Ray ray = new Ray(transform.position, Vector3.down);
+            if (Physics.Raycast(ray, out RaycastHit hit, cc.height * 0.6f + 0.2f))
+            {
+                float angle = Vector3.Angle(hit.normal, Vector3.up);
+                return angle > vars.slopeLimit;
+            }
+            return false;
+        }
+
+        public Vector3 Velocity => velocity;
+        public bool IsGrounded => isGrounded;
+        public bool IsCrouching => isCrouching;
+        public void SetVelocity(Vector3 v) => velocity = v;
+        public void Teleport(Vector3 pos)
+        {
+            cc.enabled = false;
+            transform.position = pos;
+            cc.enabled = true;
+        }
+    }
+
+    // ========================================================
+    // 3. SURF MARKER
+    // ========================================================
+    [RequireComponent(typeof(Collider))]
+    public class SurfSurface : MonoBehaviour
+    {
+        void Reset()
+        {
+            var col = GetComponent<Collider>();
+            col.isTrigger = false;
+        }
+    }
+
+    // ========================================================
+    // 4. RECOIL PATTERN
+    // ========================================================
+    [CreateAssetMenu(menuName = "Weapon/RecoilPattern", fileName = "Recoil_AK47")]
+    public class RecoilPattern : ScriptableObject
+    {
+        // x = yaw (độ), y = pitch (độ)
+        public Vector2[] points = new Vector2[]
+        {
+            new Vector2(0.00f, 0.55f), new Vector2(0.05f, 0.60f), new Vector2(-0.05f, 0.65f),
+            new Vector2(0.10f, 0.70f), new Vector2(-0.10f, 0.72f), new Vector2(0.15f, 0.75f),
+            new Vector2(-0.15f, 0.78f), new Vector2(0.20f, 0.80f), new Vector2(-0.20f, 0.82f),
+            new Vector2(0.25f, 0.85f), new Vector2(0.30f, 0.88f), new Vector2(0.35f, 0.90f),
+            new Vector2(0.40f, 0.92f), new Vector2(0.45f, 0.95f), new Vector2(0.50f, 0.98f),
+            new Vector2(0.55f, 1.00f), new Vector2(0.60f, 1.02f), new Vector2(0.65f, 1.05f),
+            new Vector2(0.70f, 1.08f), new Vector2(0.75f, 1.10f), new Vector2(0.80f, 1.12f),
+            new Vector2(0.85f, 1.15f), new Vector2(0.90f, 1.18f), new Vector2(0.95f, 1.20f),
+            new Vector2(1.00f, 1.22f), new Vector2(1.05f, 1.25f), new Vector2(1.10f, 1.28f),
+            new Vector2(1.15f, 1.30f), new Vector2(1.20f, 1.32f), new Vector2(1.25f, 1.35f),
+        };
+    }
+
+    // ========================================================
+    // 5. RECOIL CONTROLLER
+    // ========================================================
+    public class RecoilController : MonoBehaviour
+    {
+        public RecoilPattern pattern;
+        public Transform cameraTransform;
+
+        [Header("Tuning")]
+        public float recoverySpeed = 6f;
+        public float snapSpeed     = 20f;
+        public float fireRate      = 0.1f;
+
+        private int shotIndex;
+        private Vector2 target;
+        private Vector2 current;
+        private float lastFireTime = -999f;
+        private Quaternion baseRotation;
+
+        void Awake()
+        {
+            if (cameraTransform != null) baseRotation = cameraTransform.localRotation;
+        }
+
+        public void OnFire()
+        {
+            if (Time.time - lastFireTime < fireRate) return;
+            lastFireTime = Time.time;
+
+            if (shotIndex >= pattern.points.Length)
+                shotIndex = pattern.points.Length - 1;
+
+            target += pattern.points[shotIndex];
+            shotIndex++;
+        }
+
+        public void OnStopFiring() => shotIndex = 0;
+
+        void Update()
+        {
+            if (shotIndex == 0 && target != Vector2.zero)
+            {
+                target = Vector2.Lerp(target, Vector2.zero, recoverySpeed * Time.deltaTime);
+                if (target.magnitude < 0.01f) target = Vector2.zero;
+            }
+
+            current = Vector2.Lerp(current, target, snapSpeed * Time.deltaTime);
+
+            if (cameraTransform != null)
+                cameraTransform.localRotation =
+                    baseRotation * Quaternion.Euler(-current.y, current.x, 0f);
+        }
+
+        public Vector2 CurrentRecoil => current;
+    }
+
+    // ========================================================
+    // 6. INPUT STATE
+    // ========================================================
+    [Serializable]
+    public struct InputState
+    {
+        public int tick;
+        public Vector3 wishDir;
+        public bool jump, crouch;
+        public Vector2 look;
+
+        public InputState(int t, Vector3 wd, bool j, bool c, Vector2 l)
+        {
+            tick = t; wishDir = wd; jump = j; crouch = c; look = l;
+        }
+    }
+
+    // ========================================================
+    // 7. SERVER LINK (stub)
+    // ========================================================
+    public static class ServerLink
+    {
+        public static Action<InputState> OnSendInput;
+        public static void SendInput(InputState input) => OnSendInput?.Invoke(input);
+    }
+
+    // ========================================================
+    // 8. PREDICTION CONTROLLER (client)
+    // ========================================================
+    public class PredictionController : MonoBehaviour
+    {
+        public SourceMovement movement;
+        public float tickRate = 64f;
+
+        private float tickInterval;
+        private float accumulator;
+        private int currentTick;
+
+        private struct Snapshot
+        {
+            public int tick;
+            public Vector3 position;
+            public Vector3 velocity;
+            public InputState input;
+        }
+
+        private readonly List<Snapshot> history = new List<Snapshot>();
+        private const int MaxHistory = 256;
+
+        void Awake() => tickInterval = 1f / tickRate;
+
+        void Update()
+        {
+            accumulator += Time.deltaTime;
+            while (accumulator >= tickInterval)
+            {
+                accumulator -= tickInterval;
+                SimulateTick();
+            }
+        }
+
+        InputState CaptureInput()
+        {
+            Vector3 wd = new Vector3(Input.GetAxisRaw("Horizontal"), 0f, Input.GetAxisRaw("Vertical"));
+            wd = transform.TransformDirection(wd.normalized);
+            return new InputState(
+                currentTick, wd,
+                Input.GetButton("Jump"),
+                Input.GetKey(KeyCode.LeftControl),
+                new Vector2(Input.GetAxis("Mouse X"), Input.GetAxis("Mouse Y"))
+            );
+        }
+
+        void SimulateTick()
+        {
+            InputState input = CaptureInput();
+
+            history.Add(new Snapshot {
+                tick = currentTick,
+                position = transform.position,
+                velocity = movement.Velocity,
+                input = input
+            });
+            if (history.Count > MaxHistory) history.RemoveAt(0);
+
+            movement.Tick(input.wishDir, input.jump, input.crouch, tickInterval);
+            ServerLink.SendInput(input);
+            currentTick++;
+        }
+
+        public void Reconcile(int serverTick, Vector3 serverPos, Vector3 serverVel)
+        {
+            int idx = history.FindIndex(s => s.tick == serverTick);
+            if (idx < 0)
+            {
+                movement.Teleport(serverPos);
+                movement.SetVelocity(serverVel);
+                return;
+            }
+
+            movement.Teleport(serverPos);
+            movement.SetVelocity(serverVel);
+
+            for (int i = idx + 1; i < history.Count; i++)
+            {
+                var s = history[i];
+                movement.Tick(s.input.wishDir, s.input.jump, s.input.crouch, tickInterval);
+            }
+        }
+    }
+
+    // ========================================================
+    // 9. SERVER RECONCILER (server giả lập)
+    // ========================================================
+    public class ServerReconciler : MonoBehaviour
+    {
+        public SourceMovement serverMovement;
+        public float tickRate = 64f;
+
+        private readonly Queue<InputState> inputQueue = new Queue<InputState>();
+        private float tickInterval;
+        private float accumulator;
+        private int serverTick;
+
+        void Awake()
+        {
+            tickInterval = 1f / tickRate;
+            ServerLink.OnSendInput += EnqueueInput;
+        }
+
+        void OnDestroy() => ServerLink.OnSendInput -= EnqueueInput;
+
+        void EnqueueInput(InputState input) => inputQueue.Enqueue(input);
+
+        void Update()
+        {
+            accumulator += Time.deltaTime;
+            while (accumulator >= tickInterval)
+            {
+                accumulator -= tickInterval;
+
+                InputState input = inputQueue.Count > 0
+                    ? inputQueue.Dequeue()
+                    : new InputState(serverTick, Vector3.zero, false, false, Vector2.zero);
+
+                serverMovement.Tick(input.wishDir, input.jump, input.crouch, tickInterval);
+                serverTick++;
+
+                OnServerState?.Invoke(serverTick, serverMovement.transform.position, serverMovement.Velocity);
+            }
+        }
+
+        public Action<int, Vector3, Vector3> OnServerState;
+    }
+}
